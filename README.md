@@ -7,7 +7,7 @@ A simple Ansible project to verify your installation is working correctly.
 Run the test playbook to verify Ansible is working:
 
 ```bash
-cd ~/ansible-projects
+cd ansible-projects
 ansible-playbook playbooks/hello-project.yml
 ```
 
