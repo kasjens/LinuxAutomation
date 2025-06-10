@@ -1,0 +1,379 @@
+---
+- name: Install IBM Block Storage CSI Driver for Kubernetes
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    # CSI Driver Configuration
+    csi_namespace: "ibm-block-csi-driver-system"
+    operator_namespace: "ibm-block-csi-operator-system"
+    
+    # Storage System Configuration - UPDATE THESE VALUES
+    storage_system:
+      management_address: "192.168.1.100"  # Update with your FS5300 management IP
+      username: "admin"                     # Update with your username
+      password: "your_password"            # Update with your password
+      pool_name: "Pool0"                   # Update with your pool name
+      
+    # CSI Driver Version
+    csi_operator_version: "v1.12.1"
+    
+    # Storage Class Configuration
+    storage_classes:
+      - name: "ibm-block-gold"
+        pool: "{{ storage_system.pool_name }}"
+        space_efficiency: "thin"
+        fstype: "ext4"
+        volume_name_prefix: "pv"
+        
+      - name: "ibm-block-silver"
+        pool: "{{ storage_system.pool_name }}"
+        space_efficiency: "compressed"
+        fstype: "xfs"
+        volume_name_prefix: "pv"
+
+  tasks:
+    - name: Check if kubectl is available
+      command: kubectl version --client
+      register: kubectl_check
+      failed_when: false
+      changed_when: false
+
+    - name: Fail if kubectl is not available
+      fail:
+        msg: "kubectl is not available. Please install kubectl first."
+      when: kubectl_check.rc != 0
+
+    - name: Check Kubernetes cluster connectivity
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Node
+      register: cluster_check
+      failed_when: false
+
+    - name: Fail if cluster is not accessible
+      fail:
+        msg: "Cannot connect to Kubernetes cluster. Please check your kubeconfig."
+      when: cluster_check.failed is defined and cluster_check.failed
+
+    - name: Create operator namespace
+      kubernetes.core.k8s:
+        name: "{{ operator_namespace }}"
+        api_version: v1
+        kind: Namespace
+        state: present
+
+    - name: Create CSI driver namespace
+      kubernetes.core.k8s:
+        name: "{{ csi_namespace }}"
+        api_version: v1
+        kind: Namespace
+        state: present
+
+    - name: Create storage system secret
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: ibm-block-csi-driver-secret
+            namespace: "{{ csi_namespace }}"
+          type: Opaque
+          data:
+            management_address: "{{ storage_system.management_address | b64encode }}"
+            username: "{{ storage_system.username | b64encode }}"
+            password: "{{ storage_system.password | b64encode }}"
+        state: present
+
+    - name: Deploy IBM Block CSI Operator CRDs
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: apiextensions.k8s.io/v1
+          kind: CustomResourceDefinition
+          metadata:
+            name: ibmblockcsis.csi.ibm.com
+          spec:
+            group: csi.ibm.com
+            versions:
+            - name: v1
+              served: true
+              storage: true
+              schema:
+                openAPIV3Schema:
+                  type: object
+                  properties:
+                    spec:
+                      type: object
+                      properties:
+                        controller:
+                          type: object
+                        node:
+                          type: object
+                    status:
+                      type: object
+            scope: Namespaced
+            names:
+              plural: ibmblockcsis
+              singular: ibmblockcsi
+              kind: IBMBlockCSI
+        state: present
+
+    - name: Create operator service account
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: ibm-block-csi-operator
+            namespace: "{{ operator_namespace }}"
+        state: present
+
+    - name: Create operator cluster role
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRole
+          metadata:
+            name: ibm-block-csi-operator
+          rules:
+          - apiGroups: [""]
+            resources: ["nodes", "persistentvolumes", "persistentvolumeclaims", "events", "secrets", "configmaps", "serviceaccounts"]
+            verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+          - apiGroups: ["apps"]
+            resources: ["deployments", "daemonsets", "statefulsets"]
+            verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+          - apiGroups: ["storage.k8s.io"]
+            resources: ["storageclasses", "volumeattachments", "csinodes", "csidrivers"]
+            verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+          - apiGroups: ["csi.ibm.com"]
+            resources: ["ibmblockcsis"]
+            verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+          - apiGroups: ["rbac.authorization.k8s.io"]
+            resources: ["clusterroles", "clusterrolebindings", "roles", "rolebindings"]
+            verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+          - apiGroups: ["security.openshift.io"]
+            resources: ["securitycontextconstraints"]
+            verbs: ["use"]
+            resourceNames: ["privileged", "anyuid"]
+        state: present
+
+    - name: Create operator cluster role binding
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: ibm-block-csi-operator
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: ibm-block-csi-operator
+          subjects:
+          - kind: ServiceAccount
+            name: ibm-block-csi-operator
+            namespace: "{{ operator_namespace }}"
+        state: present
+
+    - name: Deploy IBM Block CSI Operator
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: ibm-block-csi-operator
+            namespace: "{{ operator_namespace }}"
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                name: ibm-block-csi-operator
+            template:
+              metadata:
+                labels:
+                  name: ibm-block-csi-operator
+              spec:
+                serviceAccountName: ibm-block-csi-operator
+                containers:
+                - name: operator
+                  image: "quay.io/ibmcsiblock/ibm-block-csi-operator:{{ csi_operator_version }}"
+                  ports:
+                  - containerPort: 60000
+                    name: metrics
+                  command:
+                  - ibm-block-csi-operator
+                  imagePullPolicy: Always
+                  env:
+                  - name: WATCH_NAMESPACE
+                    value: ""
+                  - name: POD_NAME
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: metadata.name
+                  - name: OPERATOR_NAME
+                    value: "ibm-block-csi-operator"
+        state: present
+
+    - name: Wait for operator to be ready
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: Deployment
+        name: ibm-block-csi-operator
+        namespace: "{{ operator_namespace }}"
+        wait_condition:
+          type: Available
+          status: "True"
+        wait_timeout: 300
+
+    - name: Deploy IBM Block CSI Driver instance
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: csi.ibm.com/v1
+          kind: IBMBlockCSI
+          metadata:
+            name: ibm-block-csi
+            namespace: "{{ csi_namespace }}"
+          spec:
+            controller:
+              repository: "quay.io/ibmcsiblock/ibm-block-csi-driver-controller"
+              tag: "{{ csi_operator_version }}"
+              replicas: 1
+            node:
+              repository: "quay.io/ibmcsiblock/ibm-block-csi-driver-node"
+              tag: "{{ csi_operator_version }}"
+            sidecars:
+              - name: "csi-provisioner"
+                repository: "registry.k8s.io/sig-storage/csi-provisioner"
+                tag: "v4.0.0"
+              - name: "csi-attacher"
+                repository: "registry.k8s.io/sig-storage/csi-attacher"
+                tag: "v4.5.0"
+              - name: "csi-resizer"
+                repository: "registry.k8s.io/sig-storage/csi-resizer"
+                tag: "v1.10.0"
+              - name: "csi-snapshotter"
+                repository: "registry.k8s.io/sig-storage/csi-snapshotter"
+                tag: "v7.0.1"
+              - name: "csi-node-driver-registrar"
+                repository: "registry.k8s.io/sig-storage/csi-node-driver-registrar"
+                tag: "v2.10.0"
+              - name: "livenessprobe"
+                repository: "registry.k8s.io/sig-storage/livenessprobe"
+                tag: "v2.12.0"
+        state: present
+
+    - name: Wait for CSI driver controller to be ready
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: Deployment
+        name: ibm-block-csi-controller
+        namespace: "{{ csi_namespace }}"
+        wait_condition:
+          type: Available
+          status: "True"
+        wait_timeout: 300
+
+    - name: Wait for CSI driver node daemonset to be ready
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: DaemonSet
+        name: ibm-block-csi-node
+        namespace: "{{ csi_namespace }}"
+        wait_condition:
+          type: Available
+          status: "True"
+        wait_timeout: 300
+
+    - name: Create storage classes
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: storage.k8s.io/v1
+          kind: StorageClass
+          metadata:
+            name: "{{ item.name }}"
+            annotations:
+              storageclass.kubernetes.io/is-default-class: "{{ 'true' if item.name == 'ibm-block-gold' else 'false' }}"
+          provisioner: block.csi.ibm.com
+          volumeBindingMode: Immediate
+          allowVolumeExpansion: true
+          reclaimPolicy: Delete
+          parameters:
+            SpaceEfficiency: "{{ item.space_efficiency }}"
+            pool: "{{ item.pool }}"
+            csi.storage.k8s.io/fstype: "{{ item.fstype }}"
+            volume_name_prefix: "{{ item.volume_name_prefix }}"
+            csi.storage.k8s.io/secret-name: "ibm-block-csi-driver-secret"
+            csi.storage.k8s.io/secret-namespace: "{{ csi_namespace }}"
+      loop: "{{ storage_classes }}"
+      state: present
+
+    - name: Verify CSI driver installation
+      kubernetes.core.k8s_info:
+        api_version: storage.k8s.io/v1
+        kind: CSIDriver
+        name: block.csi.ibm.com
+      register: csi_driver_check
+
+    - name: Display installation status
+      debug:
+        msg: |
+          IBM Block Storage CSI Driver installation completed successfully!
+          
+          Components deployed:
+          - Operator namespace: {{ operator_namespace }}
+          - CSI driver namespace: {{ csi_namespace }}
+          - Storage classes created: {{ storage_classes | map(attribute='name') | list | join(', ') }}
+          
+          Next steps:
+          1. Verify the installation: kubectl get pods -n {{ csi_namespace }}
+          2. Test with a PVC: kubectl apply -f test-pvc.yaml
+          3. Check storage classes: kubectl get storageclass
+          
+          Storage system configured:
+          - Management address: {{ storage_system.management_address }}
+          - Pool: {{ storage_system.pool_name }}
+      when: csi_driver_check.resources | length > 0
+
+    - name: Create test PVC example file
+      copy:
+        content: |
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: test-pvc
+            namespace: default
+          spec:
+            accessModes:
+            - ReadWriteOnce
+            resources:
+              requests:
+                storage: 10Gi
+            storageClassName: ibm-block-gold
+          ---
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: test-pod
+            namespace: default
+          spec:
+            containers:
+            - name: test-container
+              image: nginx:alpine
+              volumeMounts:
+              - name: test-volume
+                mountPath: /data
+            volumes:
+            - name: test-volume
+              persistentVolumeClaim:
+                claimName: test-pvc
+        dest: "./test-pvc-example.yaml"
+        mode: '0644'
+      delegate_to: localhost
+
+  handlers:
+    - name: Restart CSI driver
+      kubernetes.core.k8s:
+        state: restarted
+        api_version: apps/v1
+        kind: Deployment
+        name: ibm-block-csi-controller
+        namespace: "{{ csi_namespace }}"
