@@ -1,0 +1,144 @@
+---
+- name: Install Kubernetes dependencies for system-wide Ansible
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: true
+  
+  vars:
+    ansible_home: "/opt/ansible"
+    ansible_venv: "/opt/ansible/venv"
+    collections_path: "/opt/ansible/collections"
+    ansible_user: "ansible"
+
+  tasks:
+    - name: Verify Ansible installation exists
+      ansible.builtin.stat:
+        path: "{{ ansible_venv }}/bin/ansible"
+      register: ansible_install
+      failed_when: not ansible_install.stat.exists
+      tags: verify_prereqs
+
+    - name: Install Python packages in Ansible virtual environment
+      ansible.builtin.pip:
+        name:
+          - kubernetes
+          - pyyaml
+          - openshift  # Additional package for enhanced K8s support
+        executable: "{{ ansible_venv }}/bin/pip"
+        state: present
+      tags: python_packages
+
+    - name: Install Kubernetes Ansible collection
+      ansible.builtin.command:
+        cmd: "{{ ansible_venv }}/bin/ansible-galaxy collection install kubernetes.core --collections-path {{ collections_path }} --force"
+      register: galaxy_install
+      changed_when: "'was installed successfully' in galaxy_install.stdout or 'Nothing to do' not in galaxy_install.stdout"
+      become_user: "{{ ansible_user }}"
+      tags: ansible_collections
+
+    - name: Install additional useful collections for Kubernetes
+      ansible.builtin.command:
+        cmd: "{{ ansible_venv }}/bin/ansible-galaxy collection install {{ item }} --collections-path {{ collections_path }} --force"
+      loop:
+        - community.kubernetes
+        - kubernetes.core
+      register: additional_collections
+      changed_when: "'was installed successfully' in item.stdout"
+      become_user: "{{ ansible_user }}"
+      failed_when: false  # Don't fail if collections already exist
+      tags: ansible_collections
+
+    - name: Fix ownership of collections directory
+      ansible.builtin.file:
+        path: "{{ collections_path }}"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        recurse: true
+      tags: fix_permissions
+
+    - name: Create sample Kubernetes playbook
+      ansible.builtin.copy:
+        content: |
+          ---
+          - name: Kubernetes Test Playbook
+            hosts: localhost
+            connection: local
+            gather_facts: false
+            
+            tasks:
+              - name: Test kubernetes.core collection
+                kubernetes.core.k8s_info:
+                  api_version: v1
+                  kind: Namespace
+                  name: default
+                register: namespace_info
+                failed_when: false
+                
+              - name: Display connection status
+                ansible.builtin.debug:
+                  msg: >-
+                    {% if namespace_info.failed %}
+                    Kubernetes connection failed - this is expected if not connected to a cluster.
+                    Collection is installed and ready to use.
+                    {% else %}
+                    Successfully connected to Kubernetes cluster!
+                    {% endif %}
+        dest: "{{ ansible_home }}/playbooks/k8s-test.yml"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0644'
+      tags: sample_playbook
+
+    - name: Verify installations
+      block:
+        - name: Check kubernetes Python module
+          ansible.builtin.command:
+            cmd: "{{ ansible_venv }}/bin/python -c 'import kubernetes; print(\"Kubernetes Python module: Available\")"
+          register: k8s_module_check
+          changed_when: false
+
+        - name: Check PyYAML module
+          ansible.builtin.command:
+            cmd: "{{ ansible_venv }}/bin/python -c 'import yaml; print(\"PyYAML module: Available\")"
+          register: yaml_module_check
+          changed_when: false
+
+        - name: Check installed collections
+          ansible.builtin.command:
+            cmd: "{{ ansible_venv }}/bin/ansible-galaxy collection list --collections-path {{ collections_path }}"
+          register: collections_list
+          changed_when: false
+          become_user: "{{ ansible_user }}"
+
+        - name: Display verification results
+          ansible.builtin.debug:
+            msg:
+              - "{{ k8s_module_check.stdout }}"
+              - "{{ yaml_module_check.stdout }}"
+              - "Installed collections:"
+              - "{{ collections_list.stdout_lines | select('match', '.*kubernetes.*') | list }}"
+      tags: verify
+
+    - name: Display usage instructions
+      ansible.builtin.debug:
+        msg:
+          - "╔══════════════════════════════════════════════════════════════╗"
+          - "║                 Kubernetes Dependencies Installed            ║"
+          - "╠══════════════════════════════════════════════════════════════╣"
+          - "║ Python packages installed in: {{ ansible_venv }}             ║"
+          - "║ Collections installed in: {{ collections_path }}             ║"
+          - "║                                                              ║"
+          - "║ Test your installation:                                      ║"
+          - "║   ansible-playbook {{ ansible_home }}/playbooks/k8s-test.yml    ║"
+          - "║                                                              ║"
+          - "║ Example Kubernetes task:                                     ║"
+          - "║   - kubernetes.core.k8s:                                     ║"
+          - "║       state: present                                         ║"
+          - "║       definition:                                            ║"
+          - "║         apiVersion: v1                                       ║"
+          - "║         kind: Namespace                                      ║"
+          - "║         metadata:                                            ║"
+          - "║           name: my-namespace                                 ║"
+          - "╚══════════════════════════════════════════════════════════════╝"
+      tags: usage
