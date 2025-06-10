@@ -376,6 +376,7 @@ create_system_config() {
 inventory = /etc/ansible/hosts
 library = /opt/ansible/library
 module_utils = /opt/ansible/module_utils
+collections_path = /opt/ansible/collections:/usr/share/ansible/collections
 remote_tmp = /tmp/.ansible-${USER}/tmp
 local_tmp = /tmp/.ansible-${USER}/tmp
 forks = 5
