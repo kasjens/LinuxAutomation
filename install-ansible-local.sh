@@ -44,11 +44,16 @@ check_ubuntu() {
 # Clean up any incorrect states
 cleanup_incorrect_state() {
     # Fix ansible.cfg if it's a directory
-    [[ -d "/etc/ansible/ansible.cfg" ]] && rm -rf "/etc/ansible/ansible.cfg"
+    if [[ -d "/etc/ansible/ansible.cfg" ]]; then
+        rm -rf "/etc/ansible/ansible.cfg"
+    fi
     
     # Remove broken symlinks
     for cmd in ansible ansible-playbook ansible-galaxy ansible-vault ansible-config ansible-inventory ansible-doc; do
-        [[ -L "/usr/local/bin/$cmd" ]] && [[ ! -e "/usr/local/bin/$cmd" ]] && rm -f "/usr/local/bin/$cmd"
+        local symlink_path="/usr/local/bin/$cmd"
+        if [[ -L "$symlink_path" ]] && [[ ! -e "$symlink_path" ]]; then
+            rm -f "$symlink_path"
+        fi
     done
 }
 
