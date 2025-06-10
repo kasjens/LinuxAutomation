@@ -165,7 +165,11 @@ EOF
 create_system_config() {
     log_info "Creating system-wide Ansible configuration..."
     
-    cat > "$ANSIBLE_CONFIG/ansible.cfg" << EOF
+    # Ensure the directory exists
+    mkdir -p "$ANSIBLE_CONFIG"
+    
+    # Create the configuration file with explicit path
+    cat > "/etc/ansible/ansible.cfg" << 'EOF'
 # Ansible System-Wide Configuration
 [defaults]
 inventory = $ANSIBLE_INVENTORY
@@ -251,8 +255,8 @@ diff_remove = red
 diff_lines = cyan
 EOF
     
-    chmod 644 "$ANSIBLE_CONFIG/ansible.cfg"
-    log_success "System-wide configuration created at $ANSIBLE_CONFIG/ansible.cfg"
+    chmod 644 "/etc/ansible/ansible.cfg"
+    log_success "System-wide configuration created at /etc/ansible/ansible.cfg"
 }
 
 # Set up environment for all users
@@ -260,17 +264,17 @@ setup_environment() {
     log_info "Setting up environment for all users..."
     
     # Create profile script for all users
-    cat > "/etc/profile.d/ansible.sh" << EOF
+    cat > "/etc/profile.d/ansible.sh" << 'EOF'
 # Ansible Environment Setup
-export ANSIBLE_CONFIG="$ANSIBLE_CONFIG/ansible.cfg"
-export ANSIBLE_HOME="$ANSIBLE_HOME"
-export ANSIBLE_INVENTORY="$ANSIBLE_INVENTORY"
-export ANSIBLE_PLAYBOOKS="$ANSIBLE_PLAYBOOKS"
+export ANSIBLE_CONFIG="/etc/ansible/ansible.cfg"
+export ANSIBLE_HOME="/opt/ansible"
+export ANSIBLE_INVENTORY="/etc/ansible/hosts"
+export ANSIBLE_PLAYBOOKS="/opt/ansible/playbooks"
 export ANSIBLE_LOG_PATH="/var/log/ansible/ansible.log"
 
 # Add ansible bin to PATH if not already there
-if [[ ":\$PATH:" != *":/usr/local/bin:"* ]]; then
-    export PATH="/usr/local/bin:\$PATH"
+if [[ ":$PATH:" != *":/usr/local/bin:"* ]]; then
+    export PATH="/usr/local/bin:$PATH"
 fi
 EOF
     
@@ -485,7 +489,7 @@ verify_installation() {
     
     # Test sample playbook
     log_info "Testing sample playbook..."
-    if ansible-playbook "$ANSIBLE_PLAYBOOKS/hello-world.yml"; then
+    if ansible-playbook "/opt/ansible/playbooks/hello-world.yml"; then
         log_success "Sample playbook executed successfully"
     else
         log_error "Sample playbook execution failed"
@@ -502,19 +506,19 @@ show_usage() {
 ${GREEN}Ansible System-Wide Installation Complete!${NC}
 
 ${BLUE}Installation Locations:${NC}
-  Ansible Home:       $ANSIBLE_HOME
-  Configuration:      $ANSIBLE_CONFIG/ansible.cfg
-  Inventory:          $ANSIBLE_INVENTORY
-  Playbooks:          $ANSIBLE_PLAYBOOKS
-  Virtual Environment: $ANSIBLE_VENV
+  Ansible Home:       /opt/ansible
+  Configuration:      /etc/ansible/ansible.cfg
+  Inventory:          /etc/ansible/hosts
+  Playbooks:          /opt/ansible/playbooks
+  Virtual Environment: /opt/ansible/venv
   Log Files:          /var/log/ansible/
 
 ${BLUE}Quick Start Commands (available to all users):${NC}
   ansible --version                        # Check version
   ansible local -m ping                    # Test connection
   ansible local -m setup                   # Gather facts
-  ansible-playbook $ANSIBLE_PLAYBOOKS/hello-world.yml
-  ansible-playbook $ANSIBLE_PLAYBOOKS/system-setup.yml
+  ansible-playbook /opt/ansible/playbooks/hello-world.yml
+  ansible-playbook /opt/ansible/playbooks/system-setup.yml
 
 ${BLUE}User Management:${NC}
   System user:        ansible (passwordless sudo)
@@ -527,26 +531,26 @@ ${BLUE}Example Commands:${NC}
   ansible local -m apt -a "name=htop state=present"
   
   # Manage system configuration
-  ansible-playbook $ANSIBLE_PLAYBOOKS/system-setup.yml
+  ansible-playbook /opt/ansible/playbooks/system-setup.yml
   
   # Check logs
   tail -f /var/log/ansible/ansible.log
 
 ${BLUE}File Permissions:${NC}
   - All users can read configuration and inventory
-  - Playbooks directory: $ANSIBLE_PLAYBOOKS (group writeable for ansible group)
+  - Playbooks directory: /opt/ansible/playbooks (group writeable for ansible group)
   - Logs: /var/log/ansible/ (ansible user/group)
 
 ${BLUE}Next Steps:${NC}
   1. Add users to 'ansible' group: usermod -aG ansible username
   2. Logout and login to load environment variables
-  3. Start creating your playbooks in $ANSIBLE_PLAYBOOKS
-  4. Customize inventory in $ANSIBLE_INVENTORY
+  3. Start creating your playbooks in /opt/ansible/playbooks
+  4. Customize inventory in /etc/ansible/hosts
 
 ${BLUE}Documentation:${NC}
   Official docs: https://docs.ansible.com/
-  Configuration: cat $ANSIBLE_CONFIG/ansible.cfg
-  Inventory: cat $ANSIBLE_INVENTORY
+  Configuration: cat /etc/ansible/ansible.cfg
+  Inventory: cat /etc/ansible/hosts
 
 EOF
 }
