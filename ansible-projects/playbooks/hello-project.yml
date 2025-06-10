@@ -1,0 +1,16 @@
+---
+- name: Hello from my Ansible project
+  hosts: local
+  tasks:
+    - name: Create project test file
+      copy:
+        content: |
+          This is from my personal Ansible project!
+          Created: {{ ansible_date_time.iso8601 }}
+          From: {{ inventory_hostname }}
+        dest: /tmp/my-ansible-project.txt
+        mode: '0644'
+    
+    - name: Show success message
+      debug:
+        msg: "Project playbook completed! Check /tmp/my-ansible-project.txt"
