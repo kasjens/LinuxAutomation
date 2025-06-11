@@ -1,0 +1,110 @@
+---
+- name: Diagnose Kubernetes Cluster Issues
+  hosts: localhost
+  become: yes
+  gather_facts: true
+  
+  tasks:
+    - name: Check kubelet logs
+      ansible.builtin.shell:
+        cmd: journalctl -u kubelet -n 20 --no-pager
+      register: kubelet_logs
+      changed_when: false
+
+    - name: Display kubelet logs
+      ansible.builtin.debug:
+        msg: "{{ kubelet_logs.stdout_lines }}"
+
+    - name: Check containerd socket
+      ansible.builtin.stat:
+        path: /var/run/containerd/containerd.sock
+      register: containerd_socket
+
+    - name: Check Docker socket (alternative)
+      ansible.builtin.stat:
+        path: /var/run/docker.sock
+      register: docker_socket
+
+    - name: Display socket status
+      ansible.builtin.debug:
+        msg:
+          - "Containerd socket exists: {{ containerd_socket.stat.exists }}"
+          - "Docker socket exists: {{ docker_socket.stat.exists }}"
+
+    - name: Check kubelet configuration
+      ansible.builtin.stat:
+        path: /var/lib/kubelet/config.yaml
+      register: kubelet_config
+
+    - name: Display kubelet config if exists
+      ansible.builtin.slurp:
+        path: /var/lib/kubelet/config.yaml
+      register: kubelet_config_content
+      when: kubelet_config.stat.exists
+
+    - name: Show kubelet configuration
+      ansible.builtin.debug:
+        msg: "{{ kubelet_config_content.content | b64decode }}"
+      when: kubelet_config.stat.exists
+
+    - name: Check if kubeadm configuration exists
+      ansible.builtin.stat:
+        path: /etc/kubernetes
+      register: k8s_etc_dir
+
+    - name: List kubernetes config files
+      ansible.builtin.find:
+        paths: /etc/kubernetes
+        recurse: yes
+      register: k8s_config_files
+      when: k8s_etc_dir.stat.exists
+
+    - name: Display kubernetes config files
+      ansible.builtin.debug:
+        msg: "{{ k8s_config_files.files | map(attribute='path') | list }}"
+      when: k8s_etc_dir.stat.exists
+
+    - name: Check if cluster needs to be reset
+      ansible.builtin.debug:
+        msg:
+          - "╔══════════════════════════════════════════════════════════════╗"
+          - "║                    Diagnosis Results                         ║"
+          - "╠══════════════════════════════════════════════════════════════╣"
+          - "║ Containerd socket: {{ 'OK' if containerd_socket.stat.exists else 'MISSING' }}"
+          - "║ Kubelet config: {{ 'EXISTS' if kubelet_config.stat.exists else 'MISSING' }}"
+          - "║ K8s config dir: {{ 'EXISTS' if k8s_etc_dir.stat.exists else 'MISSING' }}"
+          - "║                                                              ║"
+          - "║ Recommended actions:                                         ║"
+          - "║ 1. Check kubelet logs above for specific errors             ║"
+          - "║ 2. If config is corrupted, reset and reinitialize:          ║"
+          - "║    sudo kubeadm reset -f                                     ║"
+          - "║    ansible-playbook playbooks/install-kubernetes-single-node-cluster.yml ║"
+          - "║                                                              ║"
+          - "║ 3. If just kubelet issues, try:                             ║"
+          - "║    sudo systemctl daemon-reload                             ║"
+          - "║    sudo systemctl restart kubelet                           ║"
+          - "╚══════════════════════════════════════════════════════════════╝"
+
+    - name: Test containerd functionality
+      ansible.builtin.command:
+        cmd: ctr version
+      register: containerd_version
+      failed_when: false
+      changed_when: false
+
+    - name: Display containerd test
+      ansible.builtin.debug:
+        msg: "Containerd test: {{ 'OK' if containerd_version.rc == 0 else 'FAILED' }}"
+
+    - name: Check system resources
+      ansible.builtin.shell:
+        cmd: |
+          echo "Memory: $(free -h | grep Mem)"
+          echo "Disk: $(df -h / | tail -1)"
+          echo "Swap: $(free -h | grep Swap)"
+      register: system_resources
+      changed_when: false
+
+    - name: Display system resources
+      ansible.builtin.debug:
+        msg: "{{ system_resources.stdout_lines }}"

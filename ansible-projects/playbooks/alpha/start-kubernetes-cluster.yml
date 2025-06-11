@@ -1,0 +1,115 @@
+---
+- name: Start Kubernetes Cluster Services
+  hosts: localhost
+  become: yes
+  gather_facts: true
+  
+  tasks:
+    - name: Check if systemd services exist
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+      register: service_check
+      failed_when: false
+      loop:
+        - containerd
+        - kubelet
+        - docker
+
+    - name: Display service status
+      ansible.builtin.debug:
+        msg: "{{ item.name }} service: {{ 'exists' if item.status is defined else 'not found' }}"
+      loop: "{{ service_check.results }}"
+
+    - name: Start containerd service
+      ansible.builtin.systemd:
+        name: containerd
+        state: started
+        enabled: yes
+      when: service_check.results[0].status is defined
+
+    - name: Start docker service (if installed)
+      ansible.builtin.systemd:
+        name: docker
+        state: started
+        enabled: yes
+      when: service_check.results[2].status is defined
+      ignore_errors: yes
+
+    - name: Wait for containerd to be ready
+      ansible.builtin.pause:
+        seconds: 5
+
+    - name: Start kubelet service
+      ansible.builtin.systemd:
+        name: kubelet
+        state: started
+        enabled: yes
+      when: service_check.results[1].status is defined
+
+    - name: Wait for kubelet to stabilize
+      ansible.builtin.pause:
+        seconds: 10
+
+    - name: Check if cluster was previously initialized
+      ansible.builtin.stat:
+        path: /etc/kubernetes/admin.conf
+      register: k8s_config
+
+    - name: Display cluster initialization status
+      ansible.builtin.debug:
+        msg: "Kubernetes cluster {{ 'appears to be initialized' if k8s_config.stat.exists else 'needs to be initialized' }}"
+
+    - name: Test cluster connectivity
+      ansible.builtin.command:
+        cmd: kubectl get nodes --request-timeout=10s
+      register: nodes_check
+      failed_when: false
+      changed_when: false
+      become_user: "{{ ansible_user_id }}"
+      environment:
+        KUBECONFIG: "/home/{{ ansible_user_id }}/.kube/config"
+
+    - name: Display cluster status
+      ansible.builtin.debug:
+        msg:
+          - "╔══════════════════════════════════════════════════════════════╗"
+          - "║                    Cluster Status Check                      ║"
+          - "╠══════════════════════════════════════════════════════════════╣"
+          - "║ Services started: containerd, kubelet                        ║"
+          - "║ Cluster config exists: {{ 'Yes' if k8s_config.stat.exists else 'No' }}"
+          - "║ kubectl connectivity: {{ 'SUCCESS' if nodes_check.rc == 0 else 'FAILED' }}"
+          - "║                                                              ║"
+          - "╚══════════════════════════════════════════════════════════════╝"
+
+    - name: Display success message if cluster is running
+      ansible.builtin.debug:
+        msg:
+          - "🎉 Cluster is running! You can now install monitoring"
+          - "   Run: ansible-playbook playbooks/alpha/install-grafana-monitoring.yml"
+      when: nodes_check.rc == 0
+
+    - name: Display troubleshooting message if cluster is not running
+      ansible.builtin.debug:
+        msg:
+          - "❌ Cluster still not accessible"
+          - ""
+          - "If cluster was never set up, run:"
+          - "  ansible-playbook playbooks/install-kubernetes-single-node-cluster.yml"
+          - ""
+          - "Check logs for issues:"
+          - "  sudo journalctl -u kubelet -f"
+          - "  sudo journalctl -u containerd -f"
+      when: nodes_check.rc != 0
+
+    - name: Show nodes if cluster is accessible
+      ansible.builtin.debug:
+        msg: "{{ nodes_check.stdout_lines }}"
+      when: nodes_check.rc == 0
+
+    - name: Show next steps
+      ansible.builtin.debug:
+        msg:
+          - "Next steps:"
+          - "1. Verify cluster: kubectl get nodes"
+          - "2. Check all pods: kubectl get pods -A"
+          - "3. If all looks good, run the monitoring playbook"

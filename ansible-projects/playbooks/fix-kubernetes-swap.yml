@@ -1,0 +1,99 @@
+---
+- name: Fix Kubernetes Swap Issue
+  hosts: localhost
+  become: yes
+  gather_facts: true
+  
+  tasks:
+    - name: Check current swap status
+      ansible.builtin.shell:
+        cmd: swapon --show
+      register: swap_status
+      changed_when: false
+      failed_when: false
+
+    - name: Display current swap status
+      ansible.builtin.debug:
+        msg: "Current swap: {{ swap_status.stdout_lines if swap_status.stdout else 'No swap active' }}"
+
+    - name: Disable all swap immediately
+      ansible.builtin.shell:
+        cmd: swapoff -a
+      register: swapoff_result
+      changed_when: true
+
+    - name: Verify swap is disabled
+      ansible.builtin.shell:
+        cmd: swapon --show
+      register: swap_check
+      changed_when: false
+
+    - name: Display swap status after disable
+      ansible.builtin.debug:
+        msg: "Swap after disable: {{ swap_check.stdout_lines if swap_check.stdout else 'No swap active - SUCCESS!' }}"
+
+    - name: Comment out swap entries in /etc/fstab to prevent re-enabling on reboot
+      ansible.builtin.replace:
+        path: /etc/fstab
+        regexp: '^([^#].*\sswap\s.*)'
+        replace: '# \1'
+        backup: yes
+
+    - name: Restart kubelet service
+      ansible.builtin.systemd:
+        name: kubelet
+        state: restarted
+        daemon_reload: yes
+
+    - name: Wait for kubelet to stabilize
+      ansible.builtin.pause:
+        seconds: 10
+
+    - name: Check kubelet status
+      ansible.builtin.systemd:
+        name: kubelet
+      register: kubelet_status
+
+    - name: Display kubelet status
+      ansible.builtin.debug:
+        msg: "Kubelet status: {{ kubelet_status.status.ActiveState }}"
+
+    - name: Test kubectl connectivity
+      ansible.builtin.shell:
+        cmd: kubectl get nodes --request-timeout=10s
+      register: kubectl_test
+      failed_when: false
+      changed_when: false
+      become_user: "{{ ansible_user_id }}"
+      environment:
+        KUBECONFIG: "/home/{{ ansible_user_id }}/.kube/config"
+
+    - name: Display final status
+      ansible.builtin.debug:
+        msg:
+          - "╔══════════════════════════════════════════════════════════════╗"
+          - "║                    Swap Fix Results                          ║"
+          - "╠══════════════════════════════════════════════════════════════╣"
+          - "║ Swap disabled: ✅ YES                                        ║"
+          - "║ Kubelet status: {{ kubelet_status.status.ActiveState.upper() }}"
+          - "║ kubectl test: {{ 'SUCCESS ✅' if kubectl_test.rc == 0 else 'FAILED ❌' }}"
+          - "║                                                              ║"
+          - "{{ '║ 🎉 Cluster is now ready for monitoring installation!       ║' if kubectl_test.rc == 0 else '║ ⚠️  Still issues - check kubelet logs                       ║' }}"
+          - "{{ '║    Run: ansible-playbook playbooks/alpha/install-grafana-monitoring.yml ║' if kubectl_test.rc == 0 else '║    Run: sudo journalctl -u kubelet -f                       ║' }}"
+          - "╚══════════════════════════════════════════════════════════════╝"
+
+    - name: Show cluster nodes if successful
+      ansible.builtin.debug:
+        msg: "{{ kubectl_test.stdout_lines }}"
+      when: kubectl_test.rc == 0
+
+    - name: Show kubelet logs if still failing
+      ansible.builtin.shell:
+        cmd: journalctl -u kubelet -n 10 --no-pager
+      register: final_kubelet_logs
+      when: kubectl_test.rc != 0
+
+    - name: Display kubelet logs if still failing
+      ansible.builtin.debug:
+        msg: "{{ final_kubelet_logs.stdout_lines }}"
+      when: kubectl_test.rc != 0

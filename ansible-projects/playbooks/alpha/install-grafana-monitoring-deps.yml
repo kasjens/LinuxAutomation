@@ -1,0 +1,223 @@
+---
+- name: Install Grafana Monitoring Dependencies for Virtual Environment Ansible
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: true
+  
+  vars:
+    ansible_venv: "/opt/ansible/venv"
+    collections_path: "/opt/ansible/collections"
+    ansible_user: "ansible"
+
+  tasks:
+    - name: Verify Ansible virtual environment exists
+      ansible.builtin.stat:
+        path: "{{ ansible_venv }}/bin/ansible"
+      register: ansible_venv_check
+      failed_when: not ansible_venv_check.stat.exists
+
+    - name: Install Python Kubernetes dependencies in Ansible virtual environment
+      ansible.builtin.pip:
+        name:
+          - kubernetes>=28.1.0
+          - pyyaml>=6.0
+          - openshift>=0.13.0
+          - requests>=2.25.0
+        executable: "{{ ansible_venv }}/bin/pip"
+        state: present
+        extra_args: "--upgrade"
+
+    - name: Ensure ansible user home directory exists
+      ansible.builtin.file:
+        path: "/home/{{ ansible_user }}"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0755'
+
+    - name: Create ansible user .ansible directory
+      ansible.builtin.file:
+        path: "/home/{{ ansible_user }}/.ansible"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0755'
+
+    - name: Create ansible user .ansible/tmp directory
+      ansible.builtin.file:
+        path: "/home/{{ ansible_user }}/.ansible/tmp"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0755'
+
+    - name: Clean existing collections if they exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ collections_path }}/ansible_collections"
+        - "/opt/ansible/.ansible"
+      ignore_errors: true
+      
+    - name: Ensure collections directory exists with proper permissions
+      ansible.builtin.file:
+        path: "{{ collections_path }}"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0755'
+
+    - name: Create ansible_collections subdirectory
+      ansible.builtin.file:
+        path: "{{ collections_path }}/ansible_collections"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0755'
+
+    - name: Install Kubernetes Ansible collection
+      ansible.builtin.command:
+        cmd: "{{ ansible_venv }}/bin/ansible-galaxy collection install kubernetes.core --collections-path {{ collections_path }} --force --no-deps"
+      register: k8s_collection_install
+      changed_when: "'was installed successfully' in k8s_collection_install.stdout"
+      become_user: "{{ ansible_user }}"
+      environment:
+        HOME: "/home/{{ ansible_user }}"
+        ANSIBLE_COLLECTIONS_PATH: "{{ collections_path }}"
+        TMPDIR: "/tmp"
+        ANSIBLE_LOCAL_TEMP: "/tmp"
+
+    - name: Install Community Kubernetes collection
+      ansible.builtin.command:
+        cmd: "{{ ansible_venv }}/bin/ansible-galaxy collection install community.kubernetes --collections-path {{ collections_path }} --force --no-deps"
+      register: community_k8s_install
+      changed_when: "'was installed successfully' in community_k8s_install.stdout"
+      become_user: "{{ ansible_user }}"
+      environment:
+        HOME: "/home/{{ ansible_user }}"
+        ANSIBLE_COLLECTIONS_PATH: "{{ collections_path }}"
+        TMPDIR: "/tmp"
+        ANSIBLE_LOCAL_TEMP: "/tmp"
+
+    - name: Fix ownership of collections directory
+      ansible.builtin.file:
+        path: "{{ collections_path }}"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        recurse: true
+
+    - name: Verify Python Kubernetes module installation
+      ansible.builtin.shell:
+        cmd: "{{ ansible_venv }}/bin/python -c 'import kubernetes; print(kubernetes.__version__)'"
+      register: k8s_module_check
+      changed_when: false
+
+    - name: Verify PyYAML module installation
+      ansible.builtin.shell:
+        cmd: "{{ ansible_venv }}/bin/python -c 'import yaml; print(yaml.__version__)'"
+      register: yaml_module_check
+      changed_when: false
+
+    - name: Verify OpenShift module installation
+      ansible.builtin.shell:
+        cmd: "{{ ansible_venv }}/bin/python -c 'import openshift; print(\"OpenShift module available\")'"
+      register: openshift_module_check
+      changed_when: false
+
+    - name: Check installed collections
+      ansible.builtin.command:
+        cmd: "{{ ansible_venv }}/bin/ansible-galaxy collection list --collections-path {{ collections_path }}"
+      register: collections_list
+      changed_when: false
+      become_user: "{{ ansible_user }}"
+
+    - name: Test kubectl connectivity
+      ansible.builtin.command:
+        cmd: kubectl cluster-info --request-timeout=5s
+      register: kubectl_test
+      failed_when: false
+      changed_when: false
+
+    - name: Create Ansible configuration for monitoring playbooks
+      ansible.builtin.copy:
+        content: |
+          [defaults]
+          inventory = inventories/development/hosts.yml
+          roles_path = roles:~/.ansible/roles:{{ ansible_venv }}/lib/python*/site-packages/ansible_collections
+          collections_path = {{ collections_path }}:~/.ansible/collections
+          host_key_checking = False
+          stdout_callback = yaml
+          interpreter_python = {{ ansible_venv }}/bin/python
+          
+          [inventory]
+          enable_plugins = kubernetes.core.k8s
+        dest: "{{ ansible_venv }}/ansible-monitoring.cfg"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0644'
+
+    - name: Display dependency installation results
+      ansible.builtin.debug:
+        msg:
+          - "╔══════════════════════════════════════════════════════════════╗"
+          - "║              Monitoring Dependencies Installed               ║"
+          - "╠══════════════════════════════════════════════════════════════╣"
+          - "║ Virtual Environment: {{ ansible_venv }}                      ║"
+          - "║ Collections Path: {{ collections_path }}                     ║"
+          - "║                                                              ║"
+          - "║ Python Modules Installed:                                    ║"
+          - "║   Kubernetes: {{ k8s_module_check.stdout }}                 ║"
+          - "║   PyYAML: {{ yaml_module_check.stdout }}                     ║"
+          - "║   OpenShift: Available                                       ║"
+          - "║                                                              ║"
+          - "║ Kubectl Status: {{ 'Connected' if kubectl_test.rc == 0 else 'Not Connected' }} ║"
+          - "║                                                              ║"
+          - "║ Now run the monitoring playbook:                             ║"
+          - "║   ANSIBLE_CONFIG={{ ansible_venv }}/ansible-monitoring.cfg    ║"
+          - "║   {{ ansible_venv }}/bin/ansible-playbook \\                 ║"
+          - "║     playbooks/alpha/install-grafana-monitoring.yml           ║"
+          - "╚══════════════════════════════════════════════════════════════╝"
+
+    - name: Create wrapper script for running monitoring playbooks
+      ansible.builtin.copy:
+        content: |
+          #!/bin/bash
+          # Monitoring Playbook Runner
+          # This script runs monitoring playbooks with proper environment setup
+          
+          export ANSIBLE_CONFIG="{{ ansible_venv }}/ansible-monitoring.cfg"
+          export ANSIBLE_COLLECTIONS_PATH="{{ collections_path }}"
+          export ANSIBLE_PYTHON_INTERPRETER="{{ ansible_venv }}/bin/python"
+          
+          if [ $# -eq 0 ]; then
+              echo "Usage: $0 <playbook.yml>"
+              echo "Example: $0 playbooks/alpha/install-grafana-monitoring.yml"
+              exit 1
+          fi
+          
+          echo "Running: {{ ansible_venv }}/bin/ansible-playbook $@"
+          echo "Config: $ANSIBLE_CONFIG"
+          echo ""
+          
+          sudo -E "{{ ansible_venv }}/bin/ansible-playbook" "$@"
+        dest: "./run-monitoring-playbook.sh"
+        mode: '0755'
+
+    - name: Show next steps
+      ansible.builtin.debug:
+        msg:
+          - "Dependencies installed successfully!"
+          - ""
+          - "To run the Grafana monitoring playbook, use one of these methods:"
+          - ""
+          - "Method 1 (Using wrapper script):"
+          - "  ./run-monitoring-playbook.sh playbooks/alpha/install-grafana-monitoring.yml"
+          - ""
+          - "Method 2 (Direct command):"
+          - "  sudo ANSIBLE_CONFIG={{ ansible_venv }}/ansible-monitoring.cfg {{ ansible_venv }}/bin/ansible-playbook playbooks/alpha/install-grafana-monitoring.yml"
+          - ""
+          - "Method 3 (Export environment first):"
+          - "  export ANSIBLE_CONFIG={{ ansible_venv }}/ansible-monitoring.cfg"
+          - "  sudo -E {{ ansible_venv }}/bin/ansible-playbook playbooks/alpha/install-grafana-monitoring.yml"

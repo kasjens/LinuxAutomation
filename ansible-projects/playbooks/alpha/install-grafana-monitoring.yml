@@ -2,8 +2,17 @@
 - name: Install Grafana and Cluster-wide Monitoring Stack
   hosts: localhost
   connection: local
-  gather_facts: false
+  gather_facts: true
+  environment:
+    K8S_AUTH_KUBECONFIG: "/home/{{ lookup('env', 'SUDO_USER') | default(ansible_user_id) }}/.kube/config"
+    KUBECONFIG: "/home/{{ lookup('env', 'SUDO_USER') | default(ansible_user_id) }}/.kube/config"
   vars:
+    # Ansible virtual environment settings
+    ansible_python_interpreter: "/opt/ansible/venv/bin/python"
+    
+    # Kubernetes configuration
+    original_user: "{{ lookup('env', 'SUDO_USER') | default(ansible_user_id) }}"
+    kubeconfig_path: "/home/{{ original_user }}/.kube/config"
     # Monitoring configuration
     monitoring_namespace: "monitoring"
     grafana_namespace: "{{ monitoring_namespace }}"
@@ -38,6 +47,37 @@
     grafana_ingress_host: "grafana.local"
 
   tasks:
+    - name: Verify Python Kubernetes module is available
+      ansible.builtin.shell:
+        cmd: "{{ ansible_python_interpreter }} -c 'import kubernetes; print(\"Kubernetes module available:\", kubernetes.__version__)'"
+      register: k8s_module_check
+      changed_when: false
+      failed_when: k8s_module_check.rc != 0
+
+    - name: Display module check result
+      ansible.builtin.debug:
+        msg: "{{ k8s_module_check.stdout }}"
+
+    - name: Check if kubeconfig exists
+      ansible.builtin.stat:
+        path: "{{ kubeconfig_path }}"
+      register: kubeconfig_stat
+
+    - name: Display kubeconfig information
+      ansible.builtin.debug:
+        msg: 
+          - "Original user: {{ original_user }}"
+          - "Kubeconfig path: {{ kubeconfig_path }}"
+          - "Kubeconfig exists: {{ kubeconfig_stat.stat.exists }}"
+
+    - name: Fail if kubeconfig is not found
+      ansible.builtin.fail:
+        msg: |
+          Kubeconfig file not found at {{ kubeconfig_path }}
+          Please ensure Kubernetes cluster is set up and accessible.
+          You may need to run: kubectl cluster-info
+      when: not kubeconfig_stat.stat.exists
+
     - name: Check if kubectl is available
       command: kubectl version --client
       register: kubectl_check
