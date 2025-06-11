@@ -1,0 +1,328 @@
+---
+- name: Manual Grafana Installation
+  hosts: localhost
+  gather_facts: true
+  environment:
+    K8S_AUTH_KUBECONFIG: "/home/{{ lookup('env', 'SUDO_USER') | default(ansible_user_id) }}/.kube/config"
+    KUBECONFIG: "/home/{{ lookup('env', 'SUDO_USER') | default(ansible_user_id) }}/.kube/config"
+  
+  vars:
+    ansible_python_interpreter: "/opt/ansible/venv/bin/python"
+    original_user: "{{ lookup('env', 'SUDO_USER') | default(ansible_user_id) }}"
+    monitoring_namespace: "monitoring"
+
+  tasks:
+    - name: Create monitoring namespace
+      kubernetes.core.k8s:
+        name: "{{ monitoring_namespace }}"
+        api_version: v1
+        kind: Namespace
+        state: present
+
+    - name: Add Helm repositories manually
+      ansible.builtin.shell:
+        cmd: |
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo add grafana https://grafana.github.io/helm-charts
+          helm repo update
+      become_user: "{{ original_user }}"
+      changed_when: true
+
+    - name: Verify Helm repositories
+      ansible.builtin.shell:
+        cmd: helm repo list
+      become_user: "{{ original_user }}"
+      register: repo_list
+
+    - name: Display repositories
+      ansible.builtin.debug:
+        msg: "{{ repo_list.stdout_lines }}"
+
+    - name: Check if Grafana is already installed
+      ansible.builtin.shell:
+        cmd: helm list -n {{ monitoring_namespace }} | grep grafana || echo "not found"
+      become_user: "{{ original_user }}"
+      register: grafana_exists
+      changed_when: false
+
+    - name: Display existing installation status
+      ansible.builtin.debug:
+        msg: "Grafana installation status: {{ 'EXISTS' if 'grafana' in grafana_exists.stdout else 'NOT FOUND' }}"
+
+    - name: Uninstall existing Grafana if present
+      ansible.builtin.shell:
+        cmd: helm uninstall grafana -n {{ monitoring_namespace }}
+      become_user: "{{ original_user }}"
+      when: "'grafana' in grafana_exists.stdout"
+      register: grafana_uninstall
+
+    - name: Wait for Grafana resources to be cleaned up
+      ansible.builtin.pause:
+        seconds: 10
+      when: "'grafana' in grafana_exists.stdout"
+
+    - name: Force delete any remaining Grafana pods
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: Pod
+        namespace: "{{ monitoring_namespace }}"
+        label_selectors:
+          - "app.kubernetes.io/name=grafana"
+        wait: true
+        wait_timeout: 60
+      when: "'grafana' in grafana_exists.stdout"
+
+    - name: Install Grafana using Helm command
+      ansible.builtin.shell:
+        cmd: |
+          helm install grafana grafana/grafana \
+            --namespace {{ monitoring_namespace }} \
+            --set service.type=NodePort \
+            --set service.nodePort=30000 \
+            --set adminPassword=admin123 \
+            --set persistence.enabled=false \
+            --wait --timeout=10m
+      become_user: "{{ original_user }}"
+      register: grafana_install
+      
+    - name: Display installation result
+      ansible.builtin.debug:
+        msg: "{{ grafana_install.stdout_lines }}"
+
+    - name: Wait for Grafana pod to be ready
+      ansible.builtin.shell:
+        cmd: kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=grafana -n {{ monitoring_namespace }} --timeout=300s
+      become_user: "{{ original_user }}"
+
+    - name: Get Grafana service details
+      ansible.builtin.shell:
+        cmd: kubectl get svc -n {{ monitoring_namespace }}
+      become_user: "{{ original_user }}"
+      register: services
+
+    - name: Display service details
+      ansible.builtin.debug:
+        msg: "{{ services.stdout_lines }}"
+
+    - name: Get Grafana pods
+      ansible.builtin.shell:
+        cmd: kubectl get pods -n {{ monitoring_namespace }}
+      become_user: "{{ original_user }}"
+      register: pods
+
+    - name: Display pod status
+      ansible.builtin.debug:
+        msg: "{{ pods.stdout_lines }}"
+
+    - name: Get Grafana admin password (if different)
+      ansible.builtin.shell:
+        cmd: kubectl get secret --namespace {{ monitoring_namespace }} grafana -o jsonpath="{.data.admin-password}" | base64 --decode
+      become_user: "{{ original_user }}"
+      register: admin_password
+      failed_when: false
+
+    - name: Create simple Prometheus for basic monitoring
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: prometheus
+            namespace: "{{ monitoring_namespace }}"
+            labels:
+              app: prometheus
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: prometheus
+            template:
+              metadata:
+                labels:
+                  app: prometheus
+              spec:
+                containers:
+                - name: prometheus
+                  image: prom/prometheus:latest
+                  ports:
+                  - containerPort: 9090
+                  args:
+                    - '--config.file=/etc/prometheus/prometheus.yml'
+                    - '--storage.tsdb.path=/prometheus/'
+                    - '--web.console.libraries=/etc/prometheus/console_libraries'
+                    - '--web.console.templates=/etc/prometheus/consoles'
+                    - '--web.enable-lifecycle'
+                  volumeMounts:
+                  - name: prometheus-config
+                    mountPath: /etc/prometheus
+                volumes:
+                - name: prometheus-config
+                  configMap:
+                    name: prometheus-config
+        state: present
+
+    - name: Create Prometheus ConfigMap
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: prometheus-config
+            namespace: "{{ monitoring_namespace }}"
+          data:
+            prometheus.yml: |
+              global:
+                scrape_interval: 15s
+              scrape_configs:
+                - job_name: 'kubernetes-apiservers'
+                  kubernetes_sd_configs:
+                  - role: endpoints
+                  scheme: https
+                  tls_config:
+                    ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+                  bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+                  relabel_configs:
+                  - source_labels: [__meta_kubernetes_namespace, __meta_kubernetes_service_name, __meta_kubernetes_endpoint_port_name]
+                    action: keep
+                    regex: default;kubernetes;https
+                - job_name: 'kubernetes-nodes'
+                  kubernetes_sd_configs:
+                  - role: node
+                  scheme: https
+                  tls_config:
+                    ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+                  bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        state: present
+
+    - name: Create Prometheus Service
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: prometheus
+            namespace: "{{ monitoring_namespace }}"
+          spec:
+            selector:
+              app: prometheus
+            ports:
+            - port: 9090
+              targetPort: 9090
+            type: ClusterIP
+        state: present
+
+    - name: Check if running in WSL environment
+      ansible.builtin.shell:
+        cmd: grep -qi microsoft /proc/version && echo "true" || echo "false"
+      register: is_wsl
+      changed_when: false
+
+    - name: Display environment detection
+      ansible.builtin.debug:
+        msg: "Running in WSL environment: {{ is_wsl.stdout }}"
+
+    - name: Test NodePort accessibility
+      ansible.builtin.uri:
+        url: "http://localhost:30000"
+        method: GET
+        timeout: 5
+      register: nodeport_test
+      failed_when: false
+
+    - name: Stop any existing port-forward processes
+      ansible.builtin.shell:
+        cmd: |
+          if pgrep -f "kubectl.*port-forward.*grafana" > /dev/null 2>&1; then
+            pkill -f "kubectl.*port-forward.*grafana"
+            echo "Stopped existing port-forward processes"
+          else
+            echo "No existing port-forward processes found"
+          fi
+      become_user: "{{ original_user }}"
+      when: is_wsl.stdout == "true" or nodeport_test.failed
+      register: pkill_result
+      changed_when: "'Stopped existing' in pkill_result.stdout"
+
+    - name: Start port-forward for WSL/failed NodePort environments
+      ansible.builtin.shell:
+        cmd: |
+          echo "Starting port-forward for Grafana..."
+          nohup kubectl port-forward -n {{ monitoring_namespace }} svc/grafana 3000:80 > /tmp/grafana-portforward.log 2>&1 &
+          echo $! > /tmp/grafana-portforward.pid
+          sleep 3
+          echo "Port-forward started with PID $(cat /tmp/grafana-portforward.pid)"
+      become_user: "{{ original_user }}"
+      when: is_wsl.stdout == "true" or nodeport_test.failed
+      register: portforward_started
+      async: 10
+      poll: 0
+
+    - name: Wait for port-forward to be ready
+      ansible.builtin.wait_for:
+        port: 3000
+        host: localhost
+        timeout: 30
+      when: is_wsl.stdout == "true" or nodeport_test.failed
+
+    - name: Verify port-forward is working
+      ansible.builtin.uri:
+        url: "http://localhost:3000"
+        method: GET
+        timeout: 10
+      register: portforward_test
+      failed_when: false
+      when: is_wsl.stdout == "true" or nodeport_test.failed
+
+    - name: Create simple access instructions file
+      ansible.builtin.copy:
+        content: |
+          Grafana Access Information
+          =========================
+          
+          Environment: {{ 'WSL2' if is_wsl.stdout == 'true' else 'Linux' }}
+          Access Method: {{ 'Port-Forward (http://localhost:3000)' if (is_wsl.stdout == 'true' or nodeport_test.failed) else 'NodePort (http://localhost:30000)' }}
+          
+          Grafana URL: {{ 'http://localhost:3000' if (is_wsl.stdout == 'true' or nodeport_test.failed) else 'http://localhost:30000' }}
+          Username: admin
+          Password: {{ admin_password.stdout if admin_password.stdout else 'admin123' }}
+          
+          Prometheus Data Source URL: http://prometheus:9090
+          
+          Commands:
+          ---------
+          Check monitoring status: kubectl get pods -n {{ monitoring_namespace }}
+          View Grafana logs: kubectl logs -n {{ monitoring_namespace }} -l app.kubernetes.io/name=grafana
+          
+          {% if is_wsl.stdout == 'true' or nodeport_test.failed %}
+          Port-Forward Management:
+          -----------------------
+          Start: kubectl port-forward -n {{ monitoring_namespace }} svc/grafana 3000:80
+          Stop: pkill -f "kubectl.*port-forward.*grafana"
+          Logs: tail -f /tmp/grafana-portforward.log
+          {% endif %}
+        dest: "./grafana-access-info.txt"
+        mode: '0644'
+
+    - name: Display access information
+      ansible.builtin.debug:
+        msg:
+          - "╔══════════════════════════════════════════════════════════════╗"
+          - "║                     Grafana Installed!                       ║"
+          - "╠══════════════════════════════════════════════════════════════╣"
+          - "║                                                              ║"
+          - "{{ '║ 🌐 Grafana URL: http://localhost:3000 (Port-Forward)        ║' if (is_wsl.stdout == 'true' or nodeport_test.failed) else '║ 🌐 Grafana URL: http://localhost:30000 (NodePort)           ║' }}"
+          - "║ 👤 Username: admin                                           ║"
+          - "║ 🔑 Password: {{ admin_password.stdout if admin_password.stdout else 'admin123' }}"
+          - "║                                                              ║"
+          - "{{ '║ 🔧 WSL2 Environment - Port-forward active                   ║' if is_wsl.stdout == 'true' else '║ 🔧 Linux Environment                                        ║' }}"
+          - "{{ '║ ✅ Port-forward status: ' + ('ACTIVE' if portforward_test.status == 200 else 'FAILED') + '                           ║' if (is_wsl.stdout == 'true' or nodeport_test.failed) else '║ ✅ NodePort service ready                                   ║' }}"
+          - "║                                                              ║"
+          - "║ 📊 Prometheus Data Source: http://prometheus:9090            ║"
+          - "║ 📋 Access details saved to: ./grafana-access-info.txt       ║"
+          - "║                                                              ║"
+          - "{{ '║ 🛠️  Port-forward Management:                               ║' if (is_wsl.stdout == 'true' or nodeport_test.failed) else '║ 🛠️  Troubleshooting:                                       ║' }}"
+          - "{{ '║    Restart: kubectl port-forward -n monitoring svc/grafana 3000:80 ║' if (is_wsl.stdout == 'true' or nodeport_test.failed) else '║    Port-forward: kubectl port-forward -n monitoring svc/grafana 3000:80 ║' }}"
+          - "{{ '║    Stop: pkill -f \"kubectl.*port-forward.*grafana\"         ║' if (is_wsl.stdout == 'true' or nodeport_test.failed) else '║    Then: http://localhost:3000                               ║' }}"
+          - "║                                                              ║"
+          - "╚══════════════════════════════════════════════════════════════╝"

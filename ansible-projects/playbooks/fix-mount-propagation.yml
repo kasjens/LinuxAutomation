@@ -1,0 +1,121 @@
+---
+- name: Fix Mount Propagation for WSL2 Kubernetes
+  hosts: localhost
+  become: yes
+  gather_facts: true
+  environment:
+    K8S_AUTH_KUBECONFIG: "/home/{{ lookup('env', 'SUDO_USER') | default(ansible_user_id) }}/.kube/config"
+    KUBECONFIG: "/home/{{ lookup('env', 'SUDO_USER') | default(ansible_user_id) }}/.kube/config"
+  
+  vars:
+    ansible_python_interpreter: "/opt/ansible/venv/bin/python"
+    original_user: "{{ lookup('env', 'SUDO_USER') | default(ansible_user_id) }}"
+  
+  tasks:
+    - name: Check current mount propagation for /var/run/netns
+      ansible.builtin.shell:
+        cmd: findmnt /var/run/netns -o PROPAGATION
+      register: netns_propagation
+      failed_when: false
+      changed_when: false
+
+    - name: Display current mount propagation
+      ansible.builtin.debug:
+        msg: "Current /var/run/netns propagation: {{ netns_propagation.stdout if netns_propagation.rc == 0 else 'not mounted' }}"
+
+    - name: Create /var/run/netns directory if it doesn't exist
+      ansible.builtin.file:
+        path: /var/run/netns
+        state: directory
+        mode: '0755'
+
+    - name: Make root filesystem shared (required for WSL2)
+      ansible.builtin.shell:
+        cmd: mount --make-rshared /
+      changed_when: true
+
+    - name: Ensure /var/run/netns is mounted with shared propagation
+      ansible.builtin.shell:
+        cmd: |
+          if ! mountpoint -q /var/run/netns; then
+            mount --bind /var/run/netns /var/run/netns
+          fi
+          mount --make-shared /var/run/netns
+      changed_when: true
+
+    - name: Verify mount propagation is now correct
+      ansible.builtin.shell:
+        cmd: findmnt /var/run/netns -o PROPAGATION
+      register: netns_propagation_after
+      changed_when: false
+
+    - name: Display updated mount propagation
+      ansible.builtin.debug:
+        msg: "Updated /var/run/netns propagation: {{ netns_propagation_after.stdout }}"
+
+    - name: Fix other mount points that might cause issues
+      ansible.builtin.shell:
+        cmd: |
+          mount --make-rshared /sys/fs/bpf || true
+          mount --make-rshared /run/cilium || true
+          mount --make-rshared /var/run/cilium || true
+      changed_when: true
+
+    - name: Delete the problematic Cilium pod to force restart
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: Pod
+        namespace: kube-system
+        name: cilium-89mtw
+        wait: true
+        wait_timeout: 120
+
+    - name: Wait for Cilium pod to be recreated
+      ansible.builtin.pause:
+        seconds: 30
+
+    - name: Check if new Cilium pod is running
+      ansible.builtin.shell:
+        cmd: kubectl get pods -n kube-system -l k8s-app=cilium
+      register: cilium_status
+      become_user: "{{ original_user }}"
+
+    - name: Display Cilium pod status
+      ansible.builtin.debug:
+        msg: "{{ cilium_status.stdout_lines }}"
+
+    - name: Wait longer for Cilium to stabilize
+      ansible.builtin.pause:
+        seconds: 60
+
+    - name: Check final cluster status
+      ansible.builtin.shell:
+        cmd: kubectl get pods -n kube-system
+      register: final_status
+      become_user: "{{ original_user }}"
+
+    - name: Display final cluster status
+      ansible.builtin.debug:
+        msg: "{{ final_status.stdout_lines }}"
+
+    - name: Test if networking is working
+      ansible.builtin.shell:
+        cmd: kubectl run test-pod --image=busybox --rm -it --restart=Never --timeout=30s -- ping -c 3 8.8.8.8
+      register: network_test
+      failed_when: false
+      become_user: "{{ original_user }}"
+
+    - name: Display fix results
+      ansible.builtin.debug:
+        msg:
+          - "╔══════════════════════════════════════════════════════════════╗"
+          - "║                Mount Propagation Fix Results                 ║"
+          - "╠══════════════════════════════════════════════════════════════╣"
+          - "║ Root filesystem: made shared                                 ║"
+          - "║ /var/run/netns: {{ 'fixed' if 'shared' in netns_propagation_after.stdout else 'needs manual fix' }}"
+          - "║ Network test: {{ 'PASSED' if network_test.rc == 0 else 'FAILED' }}"
+          - "║                                                              ║"
+          - "{{ '║ ✅ Ready for monitoring installation!                       ║' if network_test.rc == 0 else '║ ⚠️  May need additional troubleshooting                     ║' }}"
+          - "{{ '║    Run: ansible-playbook playbooks/alpha/install-grafana-monitoring.yml ║' if network_test.rc == 0 else '║    Check: kubectl logs -n kube-system -l k8s-app=cilium     ║' }}"
+          - "╚══════════════════════════════════════════════════════════════╝"
