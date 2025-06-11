@@ -3,9 +3,9 @@
   hosts: localhost
   become: yes
   vars:
-    k8s_version: "1.30"
+    k8s_version: "1.31"
     pod_network_cidr: "10.244.0.0/16"
-    ansible_user: "{{ ansible_user_id }}"
+    ansible_user: "{{ lookup('env', 'USER') }}"
     
   tasks:
     # Prerequisites and system setup
@@ -57,11 +57,17 @@
       shell: containerd config default > /etc/containerd/config.toml
 
     - name: Configure containerd to use systemd cgroup driver
-      lineinfile:
+      replace:
         path: /etc/containerd/config.toml
-        regexp: '            SystemdCgroup = false'
-        line: '            SystemdCgroup = true'
-        state: present
+        regexp: 'SystemdCgroup = false'
+        replace: 'SystemdCgroup = true'
+      notify: restart containerd
+
+    - name: Enable containerd CRI plugin
+      replace:
+        path: /etc/containerd/config.toml
+        regexp: 'disabled_plugins.*'
+        replace: 'disabled_plugins = []'
       notify: restart containerd
 
     - name: Create Docker daemon configuration
@@ -91,6 +97,9 @@
         state: started
         enabled: yes
 
+    - name: Flush handlers to ensure containerd is properly configured
+      meta: flush_handlers
+
     - name: Add user to docker group
       user:
         name: "{{ ansible_user }}"
@@ -98,6 +107,30 @@
         append: yes
 
     # Kubernetes installation
+    - name: Remove any existing Kubernetes repository
+      file:
+        path: /etc/apt/sources.list.d/kubernetes.list
+        state: absent
+
+    - name: Unhold Kubernetes packages
+      dpkg_selections:
+        name: "{{ item }}"
+        selection: install
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+      ignore_errors: yes
+
+    - name: Remove existing Kubernetes packages
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: absent
+        purge: yes
+
     - name: Add Kubernetes GPG key
       apt_key:
         url: https://pkgs.k8s.io/core:/stable:/v{{ k8s_version }}/deb/Release.key
@@ -109,13 +142,18 @@
         state: present
         filename: kubernetes
 
-    - name: Install Kubernetes components
+    - name: Update apt cache after adding Kubernetes repository
+      apt:
+        update_cache: yes
+
+    - name: Install specific Kubernetes components
       apt:
         name:
-          - kubelet
-          - kubeadm
-          - kubectl
+          - kubelet={{ k8s_version }}.*
+          - kubeadm={{ k8s_version }}.*
+          - kubectl={{ k8s_version }}.*
         state: present
+        allow_downgrade: yes
 
     - name: Hold Kubernetes packages
       dpkg_selections:
@@ -168,8 +206,13 @@
         path: /etc/kubernetes/admin.conf
       register: k8s_admin_conf
 
+    - name: Reset kubeadm if previous initialization failed
+      shell: kubeadm reset -f --cri-socket unix:///var/run/containerd/containerd.sock
+      when: not k8s_admin_conf.stat.exists
+      ignore_errors: yes
+
     - name: Initialize Kubernetes cluster
-      shell: kubeadm init --pod-network-cidr={{ pod_network_cidr }} --cri-socket unix:///var/run/containerd/containerd.sock
+      shell: kubeadm init --pod-network-cidr={{ pod_network_cidr }} --cri-socket unix:///var/run/containerd/containerd.sock --kubernetes-version=v{{ k8s_version }}.0
       when: not k8s_admin_conf.stat.exists
 
     # Configure kubectl for the user
