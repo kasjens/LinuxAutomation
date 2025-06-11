@@ -100,6 +100,10 @@
     - name: Flush handlers to ensure containerd is properly configured
       meta: flush_handlers
 
+    - name: Wait for containerd to be fully ready
+      pause:
+        seconds: 10
+
     - name: Add user to docker group
       user:
         name: "{{ ansible_user }}"
@@ -174,6 +178,21 @@
         regexp: '.*swap.*'
         state: absent
 
+    - name: Fix mount propagation for WSL2/containerized environments
+      shell: mount --make-rshared /
+      become: yes
+
+    - name: Ensure /var/run/netns exists with proper permissions
+      file:
+        path: /var/run/netns
+        state: directory
+        mode: '0755'
+
+    - name: Make /var/run/netns shared mount
+      shell: mount --make-rshared /var/run/netns || true
+      become: yes
+      ignore_errors: yes
+
     - name: Load required kernel modules
       modprobe:
         name: "{{ item }}"
@@ -233,6 +252,13 @@
         mode: '0644'
         remote_src: yes
 
+    - name: Ensure kubectl config is accessible
+      file:
+        path: "/home/{{ ansible_user }}/.kube/config"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0600'
+
     # Remove taint from master node (single-node setup)
     - name: Remove taint from master node
       shell: kubectl taint nodes --all node-role.kubernetes.io/control-plane-
@@ -240,6 +266,22 @@
         KUBECONFIG: "/home/{{ ansible_user }}/.kube/config"
       become_user: "{{ ansible_user }}"
       ignore_errors: yes
+
+    - name: Remove unreachable taint if present
+      shell: kubectl taint nodes --all node.kubernetes.io/unreachable:NoSchedule-
+      environment:
+        KUBECONFIG: "/home/{{ ansible_user }}/.kube/config"
+      become_user: "{{ ansible_user }}"
+      ignore_errors: yes
+
+    - name: Restart kubelet after mount configuration
+      systemd:
+        name: kubelet
+        state: restarted
+
+    - name: Wait for kubelet to stabilize
+      pause:
+        seconds: 15
 
     # Install CNI (Cilium)
     - name: Install Cilium CLI
@@ -271,14 +313,28 @@
 
     # Wait for nodes to be ready
     - name: Wait for node to be ready
-      shell: kubectl get nodes | grep " Ready"
+      shell: kubectl get nodes | grep -E "(Ready|NotReady)"
       environment:
         KUBECONFIG: "/home/{{ ansible_user }}/.kube/config"
       become_user: "{{ ansible_user }}"
       register: node_status
-      until: node_status.rc == 0
+      until: "'Ready' in node_status.stdout and 'NotReady' not in node_status.stdout"
       retries: 30
       delay: 10
+
+    - name: Display cluster status
+      debug:
+        msg: |
+          Kubernetes cluster setup complete!
+          
+          To use your cluster:
+          - kubectl get nodes
+          - kubectl get pods -A
+          - cilium status
+          
+          To test with a simple deployment:
+          - kubectl create deployment nginx --image=nginx
+          - kubectl get pods
 
     # Install useful tools
     - name: Install Helm
