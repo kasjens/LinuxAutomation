@@ -230,21 +230,29 @@
       register: nodeport_test
       failed_when: false
 
+    - name: Display NodePort test result
+      ansible.builtin.debug:
+        msg: "NodePort accessibility: {{ 'SUCCESS' if nodeport_test.status == 200 else 'FAILED' }}"
+
     - name: Stop any existing port-forward processes
       ansible.builtin.shell:
         cmd: |
-          if pgrep -f "kubectl.*port-forward.*grafana" > /dev/null 2>&1; then
-            pkill -f "kubectl.*port-forward.*grafana"
+          # Find and kill port-forward processes more safely
+          PIDS=$(pgrep -f "kubectl.*port-forward.*grafana" 2>/dev/null || echo "")
+          if [ -n "$PIDS" ]; then
+            echo "Found port-forward processes: $PIDS"
+            kill $PIDS 2>/dev/null || true
+            sleep 2
             echo "Stopped existing port-forward processes"
           else
             echo "No existing port-forward processes found"
           fi
       become_user: "{{ original_user }}"
-      when: is_wsl.stdout == "true" or nodeport_test.failed
+      when: is_wsl.stdout == "true" and nodeport_test.status != 200
       register: pkill_result
       changed_when: "'Stopped existing' in pkill_result.stdout"
 
-    - name: Start port-forward for WSL/failed NodePort environments
+    - name: Start port-forward for WSL environments where NodePort failed
       ansible.builtin.shell:
         cmd: |
           echo "Starting port-forward for Grafana..."
@@ -253,7 +261,7 @@
           sleep 3
           echo "Port-forward started with PID $(cat /tmp/grafana-portforward.pid)"
       become_user: "{{ original_user }}"
-      when: is_wsl.stdout == "true" or nodeport_test.failed
+      when: is_wsl.stdout == "true" and nodeport_test.status != 200
       register: portforward_started
       async: 10
       poll: 0
@@ -263,7 +271,7 @@
         port: 3000
         host: localhost
         timeout: 30
-      when: is_wsl.stdout == "true" or nodeport_test.failed
+      when: is_wsl.stdout == "true" and nodeport_test.status != 200
 
     - name: Verify port-forward is working
       ansible.builtin.uri:
@@ -272,37 +280,7 @@
         timeout: 10
       register: portforward_test
       failed_when: false
-      when: is_wsl.stdout == "true" or nodeport_test.failed
-
-    - name: Create simple access instructions file
-      ansible.builtin.copy:
-        content: |
-          Grafana Access Information
-          =========================
-          
-          Environment: {{ 'WSL2' if is_wsl.stdout == 'true' else 'Linux' }}
-          Access Method: {{ 'Port-Forward (http://localhost:3000)' if (is_wsl.stdout == 'true' or nodeport_test.failed) else 'NodePort (http://localhost:30000)' }}
-          
-          Grafana URL: {{ 'http://localhost:3000' if (is_wsl.stdout == 'true' or nodeport_test.failed) else 'http://localhost:30000' }}
-          Username: admin
-          Password: {{ admin_password.stdout if admin_password.stdout else 'admin123' }}
-          
-          Prometheus Data Source URL: http://prometheus:9090
-          
-          Commands:
-          ---------
-          Check monitoring status: kubectl get pods -n {{ monitoring_namespace }}
-          View Grafana logs: kubectl logs -n {{ monitoring_namespace }} -l app.kubernetes.io/name=grafana
-          
-          {% if is_wsl.stdout == 'true' or nodeport_test.failed %}
-          Port-Forward Management:
-          -----------------------
-          Start: kubectl port-forward -n {{ monitoring_namespace }} svc/grafana 3000:80
-          Stop: pkill -f "kubectl.*port-forward.*grafana"
-          Logs: tail -f /tmp/grafana-portforward.log
-          {% endif %}
-        dest: "./grafana-access-info.txt"
-        mode: '0644'
+      when: is_wsl.stdout == "true" and nodeport_test.status != 200
 
     - name: Display access information
       ansible.builtin.debug:
@@ -311,18 +289,17 @@
           - "║                     Grafana Installed!                       ║"
           - "╠══════════════════════════════════════════════════════════════╣"
           - "║                                                              ║"
-          - "{{ '║ 🌐 Grafana URL: http://localhost:3000 (Port-Forward)        ║' if (is_wsl.stdout == 'true' or nodeport_test.failed) else '║ 🌐 Grafana URL: http://localhost:30000 (NodePort)           ║' }}"
+          - "{{ '║ 🌐 Grafana URL: http://localhost:30000 (NodePort)           ║' if nodeport_test.status == 200 else '║ 🌐 Grafana URL: http://localhost:3000 (Port-Forward)        ║' }}"
           - "║ 👤 Username: admin                                           ║"
           - "║ 🔑 Password: {{ admin_password.stdout if admin_password.stdout else 'admin123' }}"
           - "║                                                              ║"
-          - "{{ '║ 🔧 WSL2 Environment - Port-forward active                   ║' if is_wsl.stdout == 'true' else '║ 🔧 Linux Environment                                        ║' }}"
-          - "{{ '║ ✅ Port-forward status: ' + ('ACTIVE' if portforward_test.status == 200 else 'FAILED') + '                           ║' if (is_wsl.stdout == 'true' or nodeport_test.failed) else '║ ✅ NodePort service ready                                   ║' }}"
+          - "{{ '║ 🔧 WSL2 Environment - NodePort Working!                     ║' if is_wsl.stdout == 'true' and nodeport_test.status == 200 else '║ 🔧 Environment: ' + ('WSL2' if is_wsl.stdout == 'true' else 'Linux') + '                                   ║' }}"
+          - "{{ '║ ✅ NodePort service ready                                   ║' if nodeport_test.status == 200 else '║ ✅ Port-forward status: ' + ('ACTIVE' if portforward_test.status == 200 else 'FAILED') + '                           ║' }}"
           - "║                                                              ║"
           - "║ 📊 Prometheus Data Source: http://prometheus:9090            ║"
-          - "║ 📋 Access details saved to: ./grafana-access-info.txt       ║"
           - "║                                                              ║"
-          - "{{ '║ 🛠️  Port-forward Management:                               ║' if (is_wsl.stdout == 'true' or nodeport_test.failed) else '║ 🛠️  Troubleshooting:                                       ║' }}"
-          - "{{ '║    Restart: kubectl port-forward -n monitoring svc/grafana 3000:80 ║' if (is_wsl.stdout == 'true' or nodeport_test.failed) else '║    Port-forward: kubectl port-forward -n monitoring svc/grafana 3000:80 ║' }}"
-          - "{{ '║    Stop: pkill -f \"kubectl.*port-forward.*grafana\"         ║' if (is_wsl.stdout == 'true' or nodeport_test.failed) else '║    Then: http://localhost:3000                               ║' }}"
+          - "{{ '║ 🛠️  Troubleshooting:                                       ║' if nodeport_test.status == 200 else '║ 🛠️  Port-forward Management:                               ║' }}"
+          - "{{ '║    If NodePort stops working:                              ║' if nodeport_test.status == 200 else '║    Restart: kubectl port-forward -n monitoring svc/grafana 3000:80 ║' }}"
+          - "{{ '║    kubectl port-forward -n monitoring svc/grafana 3000:80   ║' if nodeport_test.status == 200 else '║    Stop: pkill -f \"kubectl.*port-forward.*grafana\"         ║' }}"
           - "║                                                              ║"
           - "╚══════════════════════════════════════════════════════════════╝"
