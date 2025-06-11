@@ -44,9 +44,9 @@
         - community.kubernetes
         - kubernetes.core
       register: additional_collections
-      changed_when: "'was installed successfully' in item.stdout"
+      changed_when: "'was installed successfully' in additional_collections.stdout"
       become_user: "{{ ansible_user }}"
-      failed_when: false  # Don't fail if collections already exist
+      failed_when: additional_collections.rc != 0  # Only fail on actual errors
       tags: ansible_collections
 
     - name: Fix ownership of collections directory
@@ -77,13 +77,13 @@
                 
               - name: Display connection status
                 ansible.builtin.debug:
-                  msg: >-
-                    {% if namespace_info.failed %}
+                  msg: |
+                    {% raw %}{% if namespace_info.failed %}{% endraw %}
                     Kubernetes connection failed - this is expected if not connected to a cluster.
                     Collection is installed and ready to use.
-                    {% else %}
+                    {% raw %}{% else %}{% endraw %}
                     Successfully connected to Kubernetes cluster!
-                    {% endif %}
+                    {% raw %}{% endif %}{% endraw %}
         dest: "{{ ansible_home }}/playbooks/k8s-test.yml"
         owner: "{{ ansible_user }}"
         group: "{{ ansible_user }}"
@@ -93,14 +93,14 @@
     - name: Verify installations
       block:
         - name: Check kubernetes Python module
-          ansible.builtin.command:
-            cmd: "{{ ansible_venv }}/bin/python -c 'import kubernetes; print(\"Kubernetes Python module: Available\")"
+          ansible.builtin.shell:
+            cmd: "{{ ansible_venv }}/bin/python -c \"import kubernetes; print('Kubernetes Python module: Available')\""
           register: k8s_module_check
           changed_when: false
 
         - name: Check PyYAML module
-          ansible.builtin.command:
-            cmd: "{{ ansible_venv }}/bin/python -c 'import yaml; print(\"PyYAML module: Available\")"
+          ansible.builtin.shell:
+            cmd: "{{ ansible_venv }}/bin/python -c \"import yaml; print('PyYAML module: Available')\""
           register: yaml_module_check
           changed_when: false
 
