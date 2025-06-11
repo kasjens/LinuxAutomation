@@ -3,8 +3,9 @@
   hosts: localhost
   become: yes
   vars:
-    k8s_version: "1.33"
+    k8s_version: "1.30"
     pod_network_cidr: "10.244.0.0/16"
+    ansible_user: "{{ ansible_user_id }}"
     
   tasks:
     # Prerequisites and system setup
@@ -27,7 +28,7 @@
         state: present
       when: ansible_os_family == "Debian"
 
-    # Docker installation
+    # Docker installation and containerd configuration
     - name: Add Docker GPG key
       apt_key:
         url: https://download.docker.com/linux/ubuntu/gpg
@@ -46,6 +47,23 @@
           - containerd.io
         state: present
 
+    - name: Create containerd config directory
+      file:
+        path: /etc/containerd
+        state: directory
+        mode: '0755'
+
+    - name: Generate containerd config
+      shell: containerd config default > /etc/containerd/config.toml
+
+    - name: Configure containerd to use systemd cgroup driver
+      lineinfile:
+        path: /etc/containerd/config.toml
+        regexp: '            SystemdCgroup = false'
+        line: '            SystemdCgroup = true'
+        state: present
+      notify: restart containerd
+
     - name: Create Docker daemon configuration
       copy:
         content: |
@@ -60,6 +78,12 @@
         dest: /etc/docker/daemon.json
         mode: '0644'
       notify: restart docker
+
+    - name: Start and enable containerd
+      systemd:
+        name: containerd
+        state: started
+        enabled: yes
 
     - name: Start and enable Docker
       systemd:
@@ -145,7 +169,7 @@
       register: k8s_admin_conf
 
     - name: Initialize Kubernetes cluster
-      shell: kubeadm init --pod-network-cidr={{ pod_network_cidr }} --cri-socket unix:///var/run/docker.sock
+      shell: kubeadm init --pod-network-cidr={{ pod_network_cidr }} --cri-socket unix:///var/run/containerd/containerd.sock
       when: not k8s_admin_conf.stat.exists
 
     # Configure kubectl for the user
@@ -224,6 +248,11 @@
     - name: restart docker
       systemd:
         name: docker
+        state: restarted
+
+    - name: restart containerd
+      systemd:
+        name: containerd
         state: restarted
 
     - name: restart kubelet
